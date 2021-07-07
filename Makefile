@@ -1,7 +1,7 @@
 CFLAGS+=-std=c99 -Wall -O2 -D_GNU_SOURCE -fPIC -fvisibility=hidden -flto
 CXXFLAGS+=-std=c++14 -Wall -O2 -fPIC -fvisibility=hidden -flto
-LIBFLAGS=`pkg-config --cflags $(GTKMM) $(GTK)`
-LIBS=`pkg-config --libs $(GTKMM) $(GTK)`
+LIBFLAGS=`pkg-config --cflags libsoup-2.4 $(GTKMM) $(GTK)`
+LIBS=`pkg-config --libs libsoup-2.4 $(GTKMM) $(GTK)`
 LDFLAGS+=-flto
 
 prefix ?= $(out)

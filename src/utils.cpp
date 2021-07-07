@@ -3,16 +3,19 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype> // ::isspace
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <regex>
 #include <stdexcept>
 
 #include <giomm.h>
 #include <glibmm/fileutils.h>
 #include <glibmm/uriutils.h>
+#include <libsoup/soup.h>
 
 #include "debug.h"
 #include "gettext.h"
@@ -23,11 +26,12 @@ using namespace Glib;
 
 const DB_playItem_t *last;
 
+static const ustring AZL_FMT = "https://www.azlyrics.com/lyrics/%1/%2.html";
 static const char *home_cache = getenv("XDG_CACHE_HOME");
 static const string lyrics_dir = (home_cache ? string(home_cache) : string(getenv("HOME")) + "/.cache")
                                + "/deadbeef/lyrics/";
 
-static experimental::optional<ustring>(*const providers[])(DB_playItem_t *) = {&get_lyrics_from_script};
+static experimental::optional<ustring>(*const providers[])(DB_playItem_t *) = {&get_lyrics_from_script, &download_lyrics_from_azlyrics};
 
 inline string cached_filename(string artist, string title) {
 	replace(artist.begin(), artist.end(), '/', '_');
@@ -137,6 +141,109 @@ experimental::optional<ustring> get_lyrics_from_script(DB_playItem_t *track) {
 		return {};
 	}
 	return {std::move(res)};
+}
+
+void alphadigitize(ustring &s) {
+    ustring res;
+    for (auto c : s)
+        if (g_unichar_isalpha(c) || g_unichar_isdigit(c))
+            res.push_back(c);
+    s = res;
+}
+
+template<typename T>
+using g_unq_ptr = std::unique_ptr<T, void (*)(gpointer)>;
+
+experimental::optional<std::string> fetch_file_as_chrome(const std::string &uri) {
+    g_unq_ptr<SoupSession> ses(soup_session_new_with_options("timeout", 10, nullptr), g_object_unref);
+    g_unq_ptr<SoupMessage> msg(soup_message_new("GET", uri.c_str()), g_object_unref);
+    soup_message_headers_append(msg->request_headers, "User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36");
+    g_unq_ptr<GInputStream> stream(soup_session_send(ses.get(), msg.get(), nullptr, nullptr), g_object_unref);
+    if (!stream || msg->status_code / 100 != 2)
+        return {};
+
+    std::array<char, 4096> buf;
+    std::string res;
+    constexpr size_t MAX_FILE_SIZE = size_t{1} << 20U; // 1MB outta be enough
+    while (true) {
+        auto nbytes = g_input_stream_read(stream.get(), buf.data(), buf.size(), nullptr, nullptr);
+        if (nbytes > 0) {
+            if (res.size() + nbytes > MAX_FILE_SIZE) {
+                cerr << "lyricbar: file '" << uri << "' too large!\n";
+                throw std::runtime_error("file too large");
+            }
+            res.append(buf.data(), nbytes);
+        } else {
+            assert(nbytes == 0);
+            return res;
+        }
+    }
+
+    return {};
+}
+
+experimental::optional<ustring> download_lyrics_from_azlyrics(DB_playItem_t *track) {
+    ustring artist;
+    ustring title;
+    {
+        pl_lock_guard guard;
+        const char *artist_raw, *title_raw;
+        artist_raw = deadbeef->pl_find_meta(track, "artist");
+        title_raw  = deadbeef->pl_find_meta(track, "title");
+        if (!artist_raw || !title_raw) {
+            return {};
+        }
+        artist = artist_raw;
+        title = title_raw;
+    }
+    artist = artist.lowercase();
+    title = title.lowercase();
+    alphadigitize(artist);
+
+    experimental::optional<std::string> doc;
+    for (;;) {
+        ustring norm_title = title;
+        alphadigitize(norm_title);
+        ustring api_url = ustring::compose(AZL_FMT,
+                uri_escape_string(artist, {}, false),
+                uri_escape_string(norm_title, {}, false));
+
+        doc = fetch_file_as_chrome(api_url);
+        if (doc)
+            break;
+
+        while (!title.empty() &&
+                *title.rbegin() != '(' && *title.rbegin() != ')' &&
+                *title.rbegin() != '[' && *title.rbegin() != ']' )
+            title.resize(title.size() - 1);
+
+        if (title.empty())
+            return {};
+        title.resize(title.size() - 1);
+    }
+    if (!doc)
+        return {};
+
+    const static regex r{R"(<div>\s*<!--\s*Usage of azlyrics.com content[^]*?-->\s*([^]*?)\s*</div>)"};
+    smatch match;
+    regex_search(*doc, match, r);
+    if (match.size() < 2) {
+        return {};
+    }
+
+    std::string lyrics = match[1];
+    static const regex br_expr(R"(<br\s*/?\s*>)");
+    lyrics = regex_replace(lyrics, br_expr, "");
+    static const regex tag_expr(R"(<[^>]*>)");
+    lyrics = regex_replace(lyrics, tag_expr, "");
+    static const regex quot_expr(R"(&quot;)");
+    lyrics = regex_replace(lyrics, quot_expr, "\"");
+    if (lyrics.empty())
+        return {};
+    if (lyrics.back() != '\n')
+        lyrics.push_back('\n');
+    return ustring(lyrics);
 }
 
 void update_lyrics(void *tr) {
